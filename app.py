@@ -14,6 +14,7 @@ from engine import (
     PROMPT_MESTRE, PROMPT_MESTRE_RESPONDE_PCS,
     PROMPT_KAEL, PROMPT_SERA, PROMPT_THORNE, STAT_NOME
 )
+import analytics
 
 # ================================================================
 # PAGE CONFIG
@@ -66,6 +67,10 @@ def init_state():
         st.session_state.client = None
     if "aventura" not in st.session_state:
         st.session_state.aventura = None
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = None
+    if "api_key_raw" not in st.session_state:
+        st.session_state.api_key_raw = ""
 
 init_state()
 
@@ -82,6 +87,11 @@ def chamar_api(sys_prompt, msg, modelo=MODELO_PC, max_t=600):
         st.session_state.mem.track(r.usage.input_tokens, r.usage.output_tokens)
         return r.content[0].text
     except Exception as e:
+        analytics.track_error(
+            st.session_state.api_key_raw,
+            st.session_state.session_id,
+            "api_error", str(e), f"modelo={modelo}"
+        )
         return f"[Erro: {e}]"
 
 
@@ -173,7 +183,7 @@ def processar_acao(inp):
     add_msg("jogador", f"🎮 {st.session_state.nome}", inp, "jogador-msg")
     st.session_state.mem.add("jogador", "acao", inp)
 
-    ctx = st.session_state.mem.contexto("mestre", 20)
+    ctx = st.session_state.mem.contexto(20)
     msg = (f"O jogador ({st.session_state.nome}) faz: {inp}\n\n"
            f"Se exigir teste, peça para rolar dados e diga qual atributo. "
            f"NÃO resolva automaticamente. Termine com gancho.")
@@ -201,7 +211,7 @@ def processar_dado(inp):
     st.session_state.mem.add("sistema", "dado", str(res))
 
     guia = GUIAS.get(detectar_tipo(acao), GUIAS["investigar"])
-    ctx = st.session_state.mem.contexto("mestre", 20)
+    ctx = st.session_state.mem.contexto(20)
     msg = (f"Jogador ({st.session_state.nome}) tentou: {acao}\n"
            f"Dados:\n{res}\nGuia: {guia[res.tier]}\n\nNarre resultado. Respeite dados. Gancho.")
 
@@ -228,7 +238,20 @@ with st.sidebar:
 
     if api_key and not st.session_state.client:
         st.session_state.client = anthropic.Anthropic(api_key=api_key)
+        st.session_state.api_key_raw = api_key
         st.success("✅ Conectado!")
+
+    # Analytics (Supabase) — config via secrets ou env vars
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = os.environ.get("SUPABASE_KEY", "")
+    try:
+        if not sb_url and hasattr(st, 'secrets'):
+            sb_url = st.secrets.get("SUPABASE_URL", "")
+            sb_key = st.secrets.get("SUPABASE_KEY", "")
+    except Exception:
+        pass
+    if sb_url and sb_key:
+        analytics.init(sb_url, sb_key)
 
     st.markdown("---")
     st.markdown("### 📊 Sessão")
@@ -252,9 +275,13 @@ with st.sidebar:
 
     st.markdown("---")
     if st.button("🆕 Nova Aventura"):
+        c = st.session_state.mem.custo()
+        analytics.session_end(st.session_state.session_id,
+                              st.session_state.mem.turno, c["ti"]+c["to"], c["usd"])
         st.session_state.mem = Memoria()
         st.session_state.msgs = []
         st.session_state.started = False
+        st.session_state.session_id = None
         st.rerun()
 
 
@@ -281,6 +308,11 @@ if not st.session_state.started:
             st.session_state.desc = desc or "Aventureiro errante"
             st.session_state.aventura = AVENTURAS[aventura_idx]
             st.session_state.started = True
+            # Track session start
+            st.session_state.session_id = analytics.session_start(
+                st.session_state.api_key_raw, nome, desc or "",
+                AVENTURAS[aventura_idx]["titulo"]
+            )
             with st.spinner("📖 O Mestre está preparando o mundo..."):
                 abertura()
             st.rerun()
@@ -321,11 +353,19 @@ if acao:
         with st.spinner("📖 O Mestre está narrando..."):
             processar_acao(acao)
 
-    # Auto-save
+    # Auto-save + Analytics
     save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessoes")
     os.makedirs(save_dir, exist_ok=True)
     st.session_state.mem.salvar_estado(
         os.path.join(save_dir, "_autosave.json"),
         st.session_state.nome, st.session_state.desc
+    )
+    # Track turn in Supabase
+    c = st.session_state.mem.custo()
+    analytics.session_update(
+        st.session_state.session_id,
+        st.session_state.mem.turno,
+        c["ti"] + c["to"],
+        c["usd"]
     )
     st.rerun()
